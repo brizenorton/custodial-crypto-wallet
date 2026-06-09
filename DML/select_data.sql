@@ -507,6 +507,10 @@ WHERE at.original_transaction_id = 'aa000000-0000-0000-0000-000000000001'
 --   acc_fee     — legacy account_fees (вычитается из баланса)
 --   total_balance     = tx_total     - tx_fee_total     - acc_fee_total
 --   available_balance = tx_available - tx_fee_available - acc_fee_total
+--
+--   * Примечание. Данный запрос виртуального баланса рассчитывает его для всех валют
+--   используя CROSS JOIN LATERAL, баланс будет отображен абсолютно для всех валют, если
+--   даже они выключены у мерчанта.
 WITH tx AS (
     SELECT
         act.account_id,
@@ -601,6 +605,125 @@ WHERE a.id = 'a1000000-0000-0000-0000-000000000001'
       OR acc_fee.full_account_fee_amount IS NOT NULL
   )
 ORDER BY cryptos.crypto ASC;
+
+-- Аналог предыдущего запроса через UNION ALL вместо CROSS JOIN LATERAL.
+--
+-- Принципиальные отличия от варианта с CROSS JOIN LATERAL:
+--
+--   1. ОХВАТ ВАЛЮТ (ключевое отличие).
+--      CROSS JOIN LATERAL потенциально раскрывает ПОЛНЫЙ список значений enum CryptoCurrency,
+--      но в данном запросе итоговый WHERE (tx IS NOT NULL OR acc_fee IS NOT NULL) отсекает
+--      строки без данных — поэтому на практике оба варианта возвращают только «живые» валюты.
+--      Разница проявляется лишь в крайнем случае: валюта, у которой есть данные ТОЛЬКО в
+--      tx_fee (нет ни транзакций, ни account_fees), в LATERAL-варианте будет отфильтрована
+--      WHERE-условием, а в UNION ALL-варианте — попадёт в результат (т.к. currencies CTE
+--      включает SELECT currency FROM tx_fee).
+--      Если убрать WHERE из LATERAL-запроса — он вернёт все значения enum, включая валюты
+--      без каких-либо данных; UNION ALL без WHERE такого не даст никогда.
+--
+--   2. ИСТОЧНИК «СПИСКА» ВАЛЮТ.
+--      LATERAL берёт список валют из enum (схема), UNION ALL — из фактических данных.
+--      При добавлении новой валюты в enum без соответствующих транзакций LATERAL (без WHERE)
+--      сразу покажет её с нулевым балансом; UNION ALL — нет.
+--
+--   3. ЗАВИСИМОСТЬ ОТ СУБД.
+--      CROSS JOIN LATERAL + enum_range — конструкция специфична для PostgreSQL.
+--      UNION ALL работает в любой SQL-совместимой СУБД.
+--
+--   4. ПРОИЗВОДИТЕЛЬНОСТЬ.
+--      LATERAL вычисляет enum один раз и соединяет его с CTE через hash-join.
+--      UNION ALL делает три дополнительных прохода по уже агрегированным CTE ради
+--      сбора DISTINCT-валют. При малом числе строк разница незначительна.
+WITH tx AS (
+    SELECT
+        act.account_id,
+        act.currency,
+        SUM(
+            CASE
+                WHEN act.type IN ('PAYOUT'::"public"."AccountTransactionType") THEN act.amount * -1
+                WHEN act.status = 'SUCCESSFUL'::"public"."TransactionStatus"
+                THEN act.amount
+                ELSE 0
+            END
+        ) AS transaction_total_balance,
+        SUM(
+            CASE
+                WHEN act.type IN ('PAYOUT'::"public"."AccountTransactionType") THEN act.amount * -1
+                WHEN act.status = 'SUCCESSFUL'::"public"."TransactionStatus"
+                    AND act.is_available = true
+                THEN act.amount
+                ELSE 0
+            END
+        ) AS transaction_available_balance
+    FROM account_transactions act
+    WHERE act.account_id = 'a1000000-0000-0000-0000-000000000001'
+      AND act.status    != 'FAILED'::"public"."TransactionStatus"
+    GROUP BY act.account_id, act.currency
+),
+tx_fee AS (
+    SELECT
+        act.account_id,
+        actf.currency,
+        SUM(
+            CASE
+                WHEN act.type IN (
+                    'CUSTOMER_TRANSACTION'::"public"."AccountTransactionType",
+                    'MERCHANT_TRANSACTION'::"public"."AccountTransactionType"
+                ) AND act.status = 'SUCCESSFUL'::"public"."TransactionStatus"
+                THEN actf.amount
+                WHEN act.type IN (
+                    'PAYOUT'::"public"."AccountTransactionType"
+                ) AND act.status != 'FAILED'::"public"."TransactionStatus"
+                THEN actf.amount
+                ELSE 0
+            END
+        ) AS total_fee_amount,
+        SUM(
+            CASE
+                WHEN act.type IN (
+                    'PAYOUT'::"public"."AccountTransactionType"
+                ) AND act.status != 'FAILED'::"public"."TransactionStatus"
+                THEN actf.amount
+                WHEN act.type IN (
+                    'CUSTOMER_TRANSACTION'::"public"."AccountTransactionType",
+                    'MERCHANT_TRANSACTION'::"public"."AccountTransactionType"
+                ) AND act.status = 'SUCCESSFUL'::"public"."TransactionStatus"
+                    AND act.is_available = true
+                THEN actf.amount
+                ELSE 0
+            END
+        ) AS available_fee_amount
+    FROM account_transaction_fees actf
+    INNER JOIN account_transactions act ON act.id = actf.account_transaction_id
+    WHERE act.account_id = 'a1000000-0000-0000-0000-000000000001'
+      AND act.status    != 'FAILED'::"public"."TransactionStatus"
+    GROUP BY act.account_id, actf.currency
+),
+acc_fee AS (
+    SELECT
+        af.account_id,
+        af.currency,
+        SUM(af.amount) AS full_account_fee_amount
+    FROM account_fees af
+    WHERE af.account_id = 'a1000000-0000-0000-0000-000000000001'
+    GROUP BY af.account_id, af.currency
+),
+currencies AS (
+    SELECT currency FROM tx
+    UNION ALL
+    SELECT currency FROM tx_fee
+    UNION ALL
+    SELECT currency FROM acc_fee
+)
+SELECT
+    c.currency,
+    COALESCE(tx.transaction_total_balance,     0) - COALESCE(tx_fee.total_fee_amount,     0) - COALESCE(acc_fee.full_account_fee_amount, 0) AS total_balance,
+    COALESCE(tx.transaction_available_balance, 0) - COALESCE(tx_fee.available_fee_amount, 0) - COALESCE(acc_fee.full_account_fee_amount, 0) AS available_balance
+FROM (SELECT DISTINCT currency FROM currencies) c
+LEFT JOIN tx      ON tx.currency      = c.currency
+LEFT JOIN tx_fee  ON tx_fee.currency  = c.currency
+LEFT JOIN acc_fee ON acc_fee.currency = c.currency
+ORDER BY c.currency ASC;
 
 -- История транзакций аккаунта за последние 30 дней
 SELECT type, currency, amount, status, timestamp, original_transaction_id
